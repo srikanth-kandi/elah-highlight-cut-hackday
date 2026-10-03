@@ -1,6 +1,6 @@
 /**
  * Gemini AI Service for Elah Highlight Cut Studio
- * Supports Google Gemini API (v1beta) with structured JSON format & smart fallback engine.
+ * Supports Google Gemini API (v1beta) with multi-model fallback & smart offline engine.
  */
 
 const SYSTEM_INSTRUCTIONS = `
@@ -31,6 +31,14 @@ CRITICAL RULES:
 - Keep timestamp parameters within reasonable bounds based on video duration provided in prompt.
 `;
 
+// Models tried in order until one responds with HTTP 200.
+// gemini-2.5-flash is the current working default (gemini-1.5-flash is deprecated/404).
+const CANDIDATE_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-3.8-flash",
+  "gemini-2.5-pro"
+];
+
 export async function generateEditPlan(userPrompt, videoDuration = 60, apiKey = "") {
   const envKey = import.meta.env.VITE_GEMINI_API_KEY || import.meta.env.VITE_GOOGLE_API_KEY || import.meta.env.VITE_ELAH_API_KEY;
   const cleanKey = apiKey?.trim() || localStorage.getItem("GEMINI_API_KEY")?.trim() || envKey?.trim();
@@ -48,8 +56,6 @@ export async function generateEditPlan(userPrompt, videoDuration = 60, apiKey = 
 }
 
 async function fetchFromGemini(userPrompt, videoDuration, apiKey) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
-
   const promptContent = `
 Video total duration: ${videoDuration} seconds.
 User Editing Request: "${userPrompt}"
@@ -72,30 +78,51 @@ Generate a structured edit plan in JSON following the system instructions.
     }
   };
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(requestBody)
-  });
+  let lastError = null;
 
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData?.error?.message || `HTTP ${response.status}`);
+  for (const model of CANDIDATE_MODELS) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody)
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        const msg = errorData?.error?.message || `HTTP ${response.status}`;
+        if (response.status === 404 || msg.includes("not found") || msg.includes("no longer available")) {
+          console.warn(`Model ${model} unavailable (${response.status}), trying next...`);
+          lastError = new Error(msg);
+          continue;
+        }
+        throw new Error(msg);
+      }
+
+      const data = await response.json();
+      let textOutput = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!textOutput) throw new Error("No text response received from Gemini API");
+
+      // Strip markdown code fences if returned (e.g. ```json ... ```)
+      textOutput = textOutput.replace(/```json/g, "").replace(/```/g, "").trim();
+
+      const parsed = JSON.parse(textOutput);
+      return {
+        source: `gemini_api (${model})`,
+        summary: parsed.summary || "AI Generated Edit Plan",
+        operations: parsed.operations || []
+      };
+    } catch (err) {
+      lastError = err;
+      if (err.message?.includes("not found") || err.message?.includes("no longer available") || err.message?.includes("404")) {
+        continue;
+      }
+      throw err;
+    }
   }
 
-  const data = await response.json();
-  const textOutput = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-  if (!textOutput) {
-    throw new Error("No text response received from Gemini API");
-  }
-
-  const parsed = JSON.parse(textOutput);
-  return {
-    source: "gemini_api",
-    summary: parsed.summary || "AI Generated Edit Plan",
-    operations: parsed.operations || []
-  };
+  throw lastError || new Error("No supported Gemini model endpoint available.");
 }
 
 /**
@@ -107,7 +134,6 @@ function fallbackEngine(userPrompt, videoDuration, note = null) {
   let summary = "Structured edit plan generated based on request analysis.";
 
   const hasExplosionOrUnsupported = lower.includes("explosion") || lower.includes("3d") || lower.includes("face swap") || lower.includes("laser");
-  
   if (hasExplosionOrUnsupported) {
     summary = "Edit request contains unsupported operations. Valid parts extracted.";
     operations.push({
@@ -117,7 +143,6 @@ function fallbackEngine(userPrompt, videoDuration, note = null) {
     });
   }
 
-  // Check for intro trim
   if (lower.includes("trim") || lower.includes("intro") || lower.includes("shorten") || lower.includes("cut start")) {
     const trimAmount = Math.min(10, Math.round(videoDuration * 0.15));
     operations.push({
@@ -127,7 +152,6 @@ function fallbackEngine(userPrompt, videoDuration, note = null) {
     });
   }
 
-  // Check for title card
   if (lower.includes("title") || lower.includes("card") || lower.includes("header") || lower.includes("beginning")) {
     operations.push({
       action: "addTitleCard",
@@ -136,7 +160,6 @@ function fallbackEngine(userPrompt, videoDuration, note = null) {
     });
   }
 
-  // Check for keep main section
   const startKeep = operations.some(o => o.action === "trimStart") ? 10 : 0;
   const endKeep = Math.round(videoDuration * 0.75);
   operations.push({
@@ -145,16 +168,14 @@ function fallbackEngine(userPrompt, videoDuration, note = null) {
     explanation: `Preserving core content segment from ${startKeep}s to ${endKeep}s.`
   });
 
-  // Check for captions
   if (lower.includes("caption") || lower.includes("subtitle") || lower.includes("takeaway") || lower.includes("text")) {
     operations.push({
       action: "addCaption",
-      params: { text: "💡 Key takeaway: Safe, structured AI video editing", start: startKeep + 5, end: startKeep + 15 },
+      params: { text: "Key takeaway: Safe, structured AI video editing", start: startKeep + 5, end: startKeep + 15 },
       explanation: "Inserting key takeaway text caption overlay."
     });
   }
 
-  // Check for outro trim
   if (lower.includes("outro") || lower.includes("end") || lower.includes("trim end")) {
     const endTrim = Math.min(8, Math.round(videoDuration * 0.1));
     operations.push({

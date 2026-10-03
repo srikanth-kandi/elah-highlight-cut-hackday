@@ -103,6 +103,7 @@ export default function App() {
           <PromptPanel
             onSubmitPrompt={handlePromptSubmit}
             isGenerating={isGenerating}
+            currentVideo={currentVideo}
           />
 
           {/* Proposed AI Plan Flow Viewer (Requires Approval) */}
